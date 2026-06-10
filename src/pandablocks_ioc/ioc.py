@@ -2089,7 +2089,7 @@ async def update(
             except (TimeoutError, OSError):
                 # Indicates PandA did not reply or the connection was lost
                 logging.error(
-                    f"PandA communication error. "
+                    "PandA communication error. "
                     "Setting all records to major alarm state and reconnecting."
                 )
                 if client.is_connected():
@@ -2226,9 +2226,7 @@ async def update(
             )
             if client.is_connected():
                 await client.close()
-            await _reconnect_client(
-                client, connection_status, all_records, poll_period
-            )
+            await _reconnect_client(client, connection_status, all_records, poll_period)
             continue
         except Exception:
             logging.exception("Exception while processing updates from PandA")

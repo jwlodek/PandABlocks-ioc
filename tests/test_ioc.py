@@ -38,9 +38,9 @@ from pandablocks_ioc._types import (
 from pandablocks_ioc.ioc import (
     IocRecordFactory,
     StringRecordLabelValidator,
+    _reconnect_client,
     _RecordUpdater,
     _TimeRecordUpdater,
-    _reconnect_client,
     get_panda_versions,
     update,
 )
@@ -915,7 +915,11 @@ async def test_update_reconnects_on_timeout():
     # First call times out, after reconnect return valid changes, then cancel
     returned_changes = Changes({}, [], [], {})
     client.send = AsyncMock(  # type: ignore
-        side_effect=[TimeoutError("no response"), returned_changes, asyncio.CancelledError()]
+        side_effect=[
+            TimeoutError("no response"),
+            returned_changes,
+            asyncio.CancelledError(),
+        ]
     )
     client.connect = AsyncMock()  # type: ignore
 
@@ -954,7 +958,11 @@ async def test_update_reconnects_on_connection_lost():
     # then cancel to exit the loop
     returned_changes = Changes({}, [], [], {})
     client.send = AsyncMock(  # type: ignore
-        side_effect=[OSError("connection reset"), returned_changes, asyncio.CancelledError()]
+        side_effect=[
+            OSError("connection reset"),
+            returned_changes,
+            asyncio.CancelledError(),
+        ]
     )
     client.connect = AsyncMock()  # type: ignore
 
