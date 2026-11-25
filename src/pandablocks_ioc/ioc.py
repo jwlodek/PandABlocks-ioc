@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from string import digits
 from typing import Any
 
-import numpy as np
 from pandablocks.asyncio import AsyncioClient
 from pandablocks.commands import (
     Arm,
@@ -20,6 +19,7 @@ from pandablocks.commands import (
     GetFieldInfo,
     Put,
 )
+from pandablocks.connections import ControlConnection
 from pandablocks.responses import (
     BitMuxFieldInfo,
     BitOutFieldInfo,
@@ -37,8 +37,7 @@ from pandablocks.responses import (
     TimeFieldInfo,
     UintFieldInfo,
 )
-from softioc import alarm, asyncio_dispatcher, builder, fields, softioc
-from softioc.imports import db_put_field
+from softioc import alarm, asyncio_dispatcher, builder, softioc
 from softioc.pythonSoftIoc import RecordWrapper
 
 from ._connection_status import ConnectionStatus, Statuses
@@ -52,6 +51,7 @@ from ._pvi import (
 )
 from ._tables import TableRecordWrapper, TableUpdater
 from ._types import (
+    FLOAT_RECORD_PRECISION,
     ONAM_STR,
     OUT_RECORD_FUNCTIONS,
     ZNAM_STR,
@@ -286,6 +286,11 @@ def extract_label_from_metadata(block_name_number, field_name: str):
     return None
 
 
+def _is_metadata(field: str) -> bool:
+    """Whether the (PandA or EPICS style) field name is a *METADATA field"""
+    return field.startswith("*METADATA")
+
+
 def _create_dicts_from_changes(
     changes: Changes, block_info_dict: dict[str, BlockInfo]
 ) -> tuple[dict[str, dict[EpicsName, RecordValue]], dict[EpicsName, RecordValue]]:
@@ -502,13 +507,7 @@ class _TimeRecordUpdater(_RecordUpdater):
             new_egu = new_val
         else:
             new_egu = self.labels[new_val]
-        array = np.require(new_egu, dtype=np.dtype("S40"))
-        db_put_field(
-            f"{self.base_record.name}.EGU",
-            fields.DBF_STRING,
-            array.ctypes.data,
-            1,
-        )
+        self.base_record.set_field("EGU", new_egu)
 
 
 @dataclass
@@ -679,6 +678,10 @@ class IocRecordFactory:
                 kwargs["initial_value"] = trim_string_value(initial_value, record_name)
             elif isinstance(initial_value, str):
                 kwargs["initial_value"] = data_type_func(initial_value)
+
+        # Give float records a sensible display precision unless one is specified
+        if data_type_func is float and "PREC" not in kwargs:
+            extra_kwargs["PREC"] = FLOAT_RECORD_PRECISION
 
         record_info = RecordInfo(
             data_type_func=data_type_func,
@@ -2018,6 +2021,27 @@ async def create_records(
     return (all_records, all_values_dict, block_info_dict)
 
 
+def _reset_client_state(client: AsyncioClient):
+    """Discard any command/response state left over from a previous connection.
+
+    AsyncioClient keeps the queue of commands awaiting a response across
+    connections, so a command that was in flight when the connection dropped
+    would be matched against the first response on the new connection, and the
+    Identify sent by connect() would never complete.
+    TODO: Remove once AsyncioClient.connect() resets this state itself.
+    """
+    client._ctrl_connection = ControlConnection()
+    client._ctrl_queues.clear()
+
+
+async def _close_client(client: AsyncioClient):
+    """Close the client, ignoring errors from an already broken connection"""
+    try:
+        await client.close()
+    except Exception:
+        logging.debug("Error closing connection to PandA", exc_info=True)
+
+
 async def _reconnect_client(
     client: AsyncioClient,
     connection_status: ConnectionStatus,
@@ -2037,6 +2061,7 @@ async def _reconnect_client(
     while True:
         await asyncio.sleep(retry_delay)
         connection_status.set_status(Statuses.CONNECTING)
+        _reset_client_state(client)
         try:
             await client.connect()
             logging.info("Reconnected to PandA successfully")
@@ -2044,11 +2069,13 @@ async def _reconnect_client(
             set_all_records_severity(all_records, alarm.NO_ALARM, alarm.UDF_ALARM)
             return
         except OSError:
+            # connect() may have opened the socket before failing on Identify
+            await _close_client(client)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
             logging.warning(
                 f"Reconnection attempt failed, retrying in {retry_delay:.1f}s"
             )
             connection_status.set_status(Statuses.DISCONNECTED)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 async def update(
@@ -2092,8 +2119,7 @@ async def update(
                     "PandA communication error. "
                     "Setting all records to major alarm state and reconnecting."
                 )
-                if client.is_connected():
-                    await client.close()
+                await _close_client(client)
                 await _reconnect_client(
                     client, connection_status, all_records, poll_period
                 )
@@ -2146,9 +2172,15 @@ async def update(
                         field = block_label
 
                 if field not in all_records:
-                    logging.error(
-                        f"Unknown field {field} returned from GetChanges values"
-                    )
+                    if _is_metadata(field) and not block_label:
+                        # Metadata such as *METADATA.DESIGN has no record. It is
+                        # reported after every reconnection, as a new connection
+                        # gets every value in its first GetChanges
+                        logging.debug(f"Ignoring {field} returned from GetChanges")
+                    else:
+                        logging.error(
+                            f"Unknown field {field} returned from GetChanges values"
+                        )
                     continue
 
                 record_info = all_records[field]
@@ -2201,6 +2233,11 @@ async def update(
             for table_field, value_list in changes.multiline_values.items():
                 table_field = PandAName(table_field)
                 table_field = panda_to_epics_name(table_field)
+                if _is_metadata(table_field):
+                    # Multiline metadata such as *METADATA.LAYOUT, which the web GUI
+                    # rewrites whenever a block is moved, is not a table
+                    logging.debug(f"Ignoring {table_field} returned from GetChanges")
+                    continue
                 # Tables must have a MODE record defined - use it to update the table
                 mode_record_name = EpicsName(table_field + ":MODE")
                 if mode_record_name not in all_records:
@@ -2224,8 +2261,7 @@ async def update(
                 "Connection error while processing updates from PandA. "
                 "Attempting reconnection."
             )
-            if client.is_connected():
-                await client.close()
+            await _close_client(client)
             await _reconnect_client(client, connection_status, all_records, poll_period)
             continue
         except Exception:

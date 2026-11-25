@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from mock.mock import MagicMock, call
 from pandablocks.asyncio import AsyncioClient
-from pandablocks.commands import Put
+from pandablocks.commands import ChangeGroup, GetChanges, Identify, Put
 from pandablocks.responses import (
     BitMuxFieldInfo,
     BitOutFieldInfo,
@@ -22,22 +23,25 @@ from pandablocks.responses import (
     TimeFieldInfo,
     UintFieldInfo,
 )
-from softioc import builder, fields
+from softioc import builder
 
 from fixtures.mocked_panda import TEST_PREFIX
 from pandablocks_ioc._connection_status import Statuses
 from pandablocks_ioc._pvi import PviGroup
 from pandablocks_ioc._types import (
+    FLOAT_RECORD_PRECISION,
     ONAM_STR,
     ZNAM_STR,
     EpicsName,
     RecordInfo,
+    RecordValue,
     ScalarRecordValue,
     StateError,
 )
 from pandablocks_ioc.ioc import (
     IocRecordFactory,
     StringRecordLabelValidator,
+    _close_client,
     _reconnect_client,
     _RecordUpdater,
     _TimeRecordUpdater,
@@ -639,25 +643,80 @@ def test_create_record_info_value_error(
     )
 
 
-@patch("pandablocks_ioc.ioc.db_put_field")
 @pytest.mark.parametrize("new_val", ["TEST2", 2])
 async def test_time_record_updater_update_egu(
-    db_put_field: MagicMock,
     mocked_time_record_updater: tuple[_TimeRecordUpdater, str],
     new_val,
 ):
     time_record_updater, test_prefix = mocked_time_record_updater
     time_record_updater.update_egu(new_val)
-    db_put_field.assert_called_once()
 
-    # Check the expected arguments are passed to db_put_field.
-    # Note we don't check the value of `array.ctypes.data` parameter as it's a pointer
-    # to a memory address so will always vary
-    put_field_args = db_put_field.call_args.args
-    expected_args = [test_prefix + ":BASE:RECORD.EGU", fields.DBF_STRING, 1]
-    for arg in expected_args:
-        assert arg in put_field_args
-    assert isinstance(put_field_args[2], int)
+    # Check the EGU field is set to the expected label via the record's set_field
+    base_record = time_record_updater.base_record
+    base_record.set_field.assert_called_once()
+    field, value = base_record.set_field.call_args.args
+    assert field == "EGU"
+    assert value == (new_val if isinstance(new_val, str) else "TEST3")
+
+
+def test_pos_out_scale_offset_have_precision(ioc_record_factory: IocRecordFactory):
+    """Test that the SCALE and OFFSET float records of a pos_out field are given a
+    display precision"""
+    field_info = PosOutFieldInfo("pos_out", None, None, capture_labels=["No", "Diff"])
+    values: dict[EpicsName, RecordValue] = {
+        TEST_RECORD: "0",
+        EpicsName(f"{TEST_RECORD}:CAPTURE"): "Diff",
+        EpicsName(f"{TEST_RECORD}:OFFSET"): "5",
+        EpicsName(f"{TEST_RECORD}:SCALE"): "0.5",
+        EpicsName(f"{TEST_RECORD}:DATASET"): "",
+        EpicsName(f"{TEST_RECORD}:UNITS"): "MyUnits",
+    }
+
+    record_dict = ioc_record_factory.create_record(TEST_RECORD, field_info, values)
+
+    offset_record = record_dict[EpicsName(f"{TEST_RECORD}:OFFSET")].record
+    scale_record = record_dict[EpicsName(f"{TEST_RECORD}:SCALE")].record
+    assert offset_record.PREC.Value() == FLOAT_RECORD_PRECISION
+    assert scale_record.PREC.Value() == FLOAT_RECORD_PRECISION
+
+
+def test_scalar_record_has_precision(ioc_record_factory: IocRecordFactory):
+    """Test that a scalar (float) record is given a display precision"""
+    field_info = ScalarFieldInfo(
+        "param", "scalar", None, offset=0, scale=0.001, units="deg"
+    )
+    values: dict[EpicsName, RecordValue] = {TEST_RECORD: "48.48"}
+
+    record_dict = ioc_record_factory.create_record(TEST_RECORD, field_info, values)
+
+    assert record_dict[TEST_RECORD].record.PREC.Value() == FLOAT_RECORD_PRECISION
+
+
+def test_time_record_has_precision(ioc_record_factory: IocRecordFactory):
+    """Test that a time (float) record is given a display precision"""
+    field_info = TimeFieldInfo("time", None, None, units_labels=["s", "ms", "min"])
+    values: dict[EpicsName, RecordValue] = {
+        TEST_RECORD: "0.1",
+        EpicsName(f"{TEST_RECORD}:UNITS"): "s",
+    }
+
+    record_dict = ioc_record_factory.create_record(TEST_RECORD, field_info, values)
+
+    assert record_dict[TEST_RECORD].record.PREC.Value() == FLOAT_RECORD_PRECISION
+
+
+def test_explicit_precision_is_not_overridden(ioc_record_factory: IocRecordFactory):
+    """Test that an explicitly provided PREC is not replaced by the float default"""
+    record_info = ioc_record_factory._create_record_info(
+        EpicsName("SomePrefix:SomeFloatRec"),
+        None,
+        builder.aOut,
+        float,
+        PviGroup.NONE,
+        PREC=2,
+    )
+
+    assert record_info.record.PREC.Value() == 2
 
 
 def test_uint_sets_record_attributes(ioc_record_factory: IocRecordFactory):
@@ -793,6 +852,39 @@ async def test_update_on_error_marks_record(caplog):
     record_info.record.set_alarm.assert_called_with(3, 17)
     assert "PandA reports field in error" in caplog.text
     assert "Setting record ABC:DEF to invalid value error state." in caplog.text
+
+
+async def test_update_ignores_metadata_without_records(caplog):
+    """Test that metadata fields with no record, which a PandA reports after every
+    reconnection and the web GUI rewrites when blocks are moved, are ignored
+    without logging errors, while unknown non-metadata fields are still logged"""
+    client = AsyncioClient("123")
+    client.send = AsyncMock()  # type: ignore
+    client.send.return_value = Changes(
+        {"*METADATA.DESIGN": "default", "ABC.UNKNOWN": "1"},
+        [],
+        [],
+        {
+            "*METADATA.LAYOUT": ['{"PULSE1": {"x": 1.0, "y": 2.0}}'],
+            "*METADATA.EXPORTS": [],
+        },
+    )
+
+    class MockConnectionStatus:
+        statuses_set = []
+        set_status = statuses_set.append
+
+    try:
+        await asyncio.wait_for(
+            update(client, MockConnectionStatus(), {}, 0.1, {}, {}),
+            timeout=0.3,
+        )
+    except TimeoutError:
+        pass
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [e for e in errors if "METADATA" in e]
+    assert "Unknown field ABC:UNKNOWN returned from GetChanges values" in errors
 
 
 async def test_update_toggles_bit_field():
@@ -990,8 +1082,9 @@ async def test_update_reconnects_on_connection_lost():
     assert Statuses.CONNECTED in mock_connection_status.statuses_set
 
 
-async def test_update_reconnects_on_oserror_during_processing():
-    """Test that an OSError outside the inner try/except triggers reconnection"""
+async def test_update_does_not_reconnect_on_non_oserror():
+    """Test that an error during processing that is not an OSError is logged
+    and the update loop continues without reconnecting"""
     client = AsyncioClient("123")
     client.is_connected = MagicMock(return_value=False)  # type: ignore
     client.close = AsyncMock()  # type: ignore
@@ -1043,16 +1136,17 @@ async def test_update_reconnects_on_oserror_during_processing():
 
 
 async def test_reconnect_exponential_backoff_caps_at_max(caplog):
-    """Test that reconnection backoff is capped at 60 seconds"""
+    """Test that the reconnection delay doubles each attempt up to 60 seconds,
+    and that the logged delay matches the delay actually waited"""
     caplog.set_level(logging.WARNING)
 
     client = AsyncioClient("123")
-    # Fail a few times to test backoff, then succeed
+    # Fail five times, then succeed
     attempts = []
 
     async def mock_connect():
         attempts.append(1)
-        if len(attempts) < 5:
+        if len(attempts) <= 5:
             raise OSError("refused")
 
     client.connect = mock_connect  # type: ignore
@@ -1067,18 +1161,81 @@ async def test_reconnect_exponential_backoff_caps_at_max(caplog):
 
     mock_connection_status = MockConnectionStatus()
 
-    # Use a short poll_period so the test doesn't take too long
-    await asyncio.wait_for(
-        _reconnect_client(client, mock_connection_status, all_records, 0.01),
-        timeout=2.0,
-    )
+    with patch("pandablocks_ioc.ioc.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        await _reconnect_client(client, mock_connection_status, all_records, 10.0)
 
-    assert len(attempts) == 5
-    # Verify exponential backoff is mentioned in logs
-    assert "Reconnection attempt failed" in caplog.text
-    # Verify delays are increasing in the log messages
-    assert "retrying in 0.0s" in caplog.text
-    assert "retrying in 0.0s" in caplog.text
+    assert len(attempts) == 6
+    delays = [c.args[0] for c in mock_sleep.call_args_list]
+    assert delays == [10.0, 20.0, 40.0, 60.0, 60.0, 60.0]
+    logged = re.findall(r"retrying in ([0-9.]+)s", caplog.text)
+    assert [float(d) for d in logged] == delays[1:]
+
+
+class FakeControlPort:
+    """Minimal PandA control port that answers *IDN?, and can be told to drop the
+    connection instead of answering the next command"""
+
+    IDN = b"OK =PandA SW: 4.0 FPGA: 4.0.0 05b15630 0a2b0249 rootfs: PandA 4.0\n"
+
+    def __init__(self):
+        self.drop_next_command = False
+        self.writers: list[asyncio.StreamWriter] = []
+
+    async def handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.writers.append(writer)
+        while line := await reader.readline():
+            if self.drop_next_command:
+                self.drop_next_command = False
+                writer.close()
+                return
+            if line.strip() == b"*IDN?":
+                writer.write(self.IDN)
+                await writer.drain()
+
+
+async def test_reconnect_after_connection_dropped_mid_command():
+    """Test that a real AsyncioClient reconnects when the connection drops while a
+    command is still awaiting its response, as happens when a PandA reboots"""
+    fake_panda = FakeControlPort()
+    server = await asyncio.start_server(fake_panda.handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    client = AsyncioClient("127.0.0.1")
+    # AsyncioClient always uses port 8888, redirect it to the fake PandA
+    connect_stream = client._ctrl_stream.connect
+    client._ctrl_stream.connect = lambda host, _: connect_stream(host, port)  # type: ignore
+
+    class MockConnectionStatus:
+        statuses_set = []
+        set_status = statuses_set.append
+
+    mock_connection_status = MockConnectionStatus()
+
+    try:
+        await client.connect()
+
+        fake_panda.drop_next_command = True
+        with pytest.raises(OSError):
+            await client.send(GetChanges(ChangeGroup.ALL, True), timeout=0.5)
+
+        # As update() does before reconnecting
+        await _close_client(client)
+        await asyncio.wait_for(
+            _reconnect_client(client, mock_connection_status, {}, 0.01), timeout=5
+        )
+        assert mock_connection_status.statuses_set[-1] == Statuses.CONNECTED
+
+        # The new connection must be usable, not just open
+        identification = await client.send(Identify(), timeout=1)
+        assert identification.software == "4.0"
+    finally:
+        await _close_client(client)
+        for writer in fake_panda.writers:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+        # Let the fake PandA's handlers see the closed connections and exit
+        await asyncio.sleep(0.1)
 
 
 @pytest.mark.parametrize(
