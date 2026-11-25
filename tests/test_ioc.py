@@ -850,6 +850,39 @@ async def test_update_on_error_marks_record(caplog):
     assert "Setting record ABC:DEF to invalid value error state." in caplog.text
 
 
+async def test_update_ignores_metadata_without_records(caplog):
+    """Test that metadata fields with no record, which a PandA reports after every
+    reconnection and the web GUI rewrites when blocks are moved, are ignored
+    without logging errors, while unknown non-metadata fields are still logged"""
+    client = AsyncioClient("123")
+    client.send = AsyncMock()  # type: ignore
+    client.send.return_value = Changes(
+        {"*METADATA.DESIGN": "default", "ABC.UNKNOWN": "1"},
+        [],
+        [],
+        {
+            "*METADATA.LAYOUT": ['{"PULSE1": {"x": 1.0, "y": 2.0}}'],
+            "*METADATA.EXPORTS": [],
+        },
+    )
+
+    class MockConnectionStatus:
+        statuses_set = []
+        set_status = statuses_set.append
+
+    try:
+        await asyncio.wait_for(
+            update(client, MockConnectionStatus(), {}, 0.1, {}, {}),
+            timeout=0.3,
+        )
+    except TimeoutError:
+        pass
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [e for e in errors if "METADATA" in e]
+    assert "Unknown field ABC:UNKNOWN returned from GetChanges values" in errors
+
+
 async def test_update_toggles_bit_field():
     """Test that a bit field whose value changed too fast for a *CHANGES poll
     to detect still toggles the value of the EPICS record"""

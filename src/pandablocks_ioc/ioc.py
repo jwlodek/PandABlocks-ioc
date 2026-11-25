@@ -45,6 +45,7 @@ from ._layout import (
     MALCOLM_PORT,
     VISIBLE_LABELS,
     LayoutTable,
+    MalcolmError,
     MalcolmLayoutClient,
 )
 from ._pvi import (
@@ -98,17 +99,16 @@ def _when_finished(task):
     create_softioc_task = None
 
 
-async def _connect_layout_client(host: str, port: int) -> MalcolmLayoutClient | None:
+async def _connect_layout_client(host: str, port: int) -> MalcolmLayoutClient:
     layout_client = MalcolmLayoutClient(host, port)
     try:
         await layout_client.connect()
-    except Exception:
+    except Exception as e:
+        # The layout records are still created, and filled in once it connects
         logging.warning(
-            f"Unable to read block layout from Malcolm at {host}:{port}, "
-            "layout records will not be created",
-            exc_info=True,
+            f"Unable to read block layout from Malcolm at {host}:{port} ({e!r}), "
+            "layout records will be invalid until it is reachable"
         )
-        return None
     return layout_client
 
 
@@ -317,6 +317,11 @@ def extract_label_from_metadata(block_name_number, field_name: str):
 
         return block_name_number
     return None
+
+
+def _is_metadata(field: str) -> bool:
+    """Whether the (PandA or EPICS style) field name is a *METADATA field"""
+    return field.startswith("*METADATA")
 
 
 def _create_dicts_from_changes(
@@ -597,8 +602,13 @@ class IocRecordFactory:
         # capture records
         self._dataset_cache: dict[EpicsName, Dataset] = {}
 
-        # Layout records keyed by Malcolm block name then layout table column
-        self._layout_records: dict[str, dict[str, RecordInfo]] = {}
+        # Layout records, as the names the block may have in the Malcolm layout table
+        # and the records keyed by layout table column
+        self._layout_records: list[tuple[tuple[str, ...], dict[str, RecordInfo]]] = []
+        # Names of layout records marked invalid, which have their alarm cleared once
+        # Malcolm reports their block. A table without it, e.g. from a Malcolm that
+        # has not yet connected to the PandA after a reboot, leaves them invalid
+        self._invalid_layout_records: set[str] = set()
 
     def _process_labels(
         self, labels: list[str], record_value: ScalarRecordValue
@@ -1911,38 +1921,47 @@ class IocRecordFactory:
         return record_dict
 
     def create_layout_records(
-        self, block: str, layout_name: str, layout_client: MalcolmLayoutClient
+        self,
+        block: str,
+        layout_names: tuple[str, ...],
+        layout_client: MalcolmLayoutClient,
     ) -> dict[EpicsName, RecordInfo]:
         """Create records to read and write the web GUI layout position and
         visibility of a block instance.
 
+        If Malcolm is not connected yet the records start invalid, and are filled in
+        by `update_layout_records` once it is.
+
         Args:
             block: The (suffixed) block name used for the record names e.g. PULSE1
-            layout_name: The name of the block in the Malcolm layout table
+            layout_names: Names the block may have in the Malcolm layout table, as
+                Malcolm may number single-instance blocks e.g. ("PCAP", "PCAP1")
             layout_client: Client used to write changes back to Malcolm
         """
-        index = layout_client.table["name"].index(layout_name)
-        columns = self._layout_records.setdefault(layout_name, {})
+        columns: dict[str, RecordInfo] = {}
+        self._layout_records.append((layout_names, columns))
         record_dict: dict[EpicsName, RecordInfo] = {}
+        index = _layout_index(layout_client.table, layout_names)
+
+        def initial_fields(column: str) -> dict[str, Any]:
+            if index is None:
+                # Not known until Malcolm connects. create_records marks the record
+                # invalid once the IOC is initialised
+                return {"initial_value": 0}
+            value = layout_client.table[column][index]
+            return {"initial_value": _layout_record_value(column, value)}
 
         def make_on_update(column: str) -> Callable:
             async def on_update(new_val: Any) -> None:
-                value = bool(new_val) if column == "visible" else float(new_val)
-                try:
-                    await layout_client.put(layout_name, **{column: value})
-                except Exception:
-                    logging.exception(
-                        f"Failed to set layout {column} of {layout_name} to {value}"
-                    )
-                    current = layout_client.table[column][
-                        layout_client.table["name"].index(layout_name)
-                    ]
-                    columns[column].record.set(
-                        _layout_record_value(column, current), process=False
-                    )
+                await self.write_layout(
+                    block, layout_names, layout_client, column, new_val
+                )
 
             return on_update
 
+        # Not blocking, unlike other records. Updates from Malcolm that arrive while
+        # a put is in progress would otherwise be deferred until it completes, then
+        # processed with on_update enabled, so would put the stale value back
         for column in ("x", "y"):
             record_name = EpicsName(f"{block}:LAYOUT:{column.upper()}")
             columns[column] = self._create_record_info(
@@ -1951,35 +1970,77 @@ class IocRecordFactory:
                 builder.aOut,
                 float,
                 PviGroup.LAYOUT,
-                initial_value=float(layout_client.table[column][index]),
+                **initial_fields(column),
                 on_update=make_on_update(column),
+                blocking=False,
             )
             record_dict[record_name] = columns[column]
 
         record_name = EpicsName(f"{block}:LAYOUT:VISIBLE")
         columns["visible"] = self._create_record_info(
             record_name,
-            "Web GUI layout visibility",
+            # Hiding a block in the web GUI also disconnects its inputs
+            "Web GUI visibility (hiding unwires it)",
             builder.mbbOut,
             int,
             PviGroup.LAYOUT,
             labels=VISIBLE_LABELS,
-            initial_value=_layout_record_value(
-                "visible", layout_client.table["visible"][index]
-            ),
+            **initial_fields("visible"),
             on_update=make_on_update("visible"),
+            blocking=False,
         )
         record_dict[record_name] = columns["visible"]
 
         return record_dict
 
+    async def write_layout(
+        self,
+        block: str,
+        layout_names: tuple[str, ...],
+        layout_client: MalcolmLayoutClient,
+        column: str,
+        new_val: Any,
+    ) -> None:
+        """Write a new value of a layout record to Malcolm, logging any failure
+        and putting the records back to what Malcolm has"""
+        value = bool(new_val) if column == "visible" else float(new_val)
+        try:
+            if not layout_client.connected:
+                raise MalcolmError("Not connected to Malcolm")
+            name = _layout_name(layout_client.table, layout_names)
+            if name is None:
+                raise MalcolmError(f"{block} is not in the Malcolm layout")
+            await layout_client.put(name, **{column: value})
+        except Exception as e:
+            message = f"Failed to set layout {column} of {block} to {value}"
+            if isinstance(e, MalcolmError):
+                logging.error(f"{message}: {e}")
+            else:
+                logging.exception(message)
+            if layout_client.connected:
+                self.update_layout_records(layout_client.table)
+
     def update_layout_records(self, table: LayoutTable) -> None:
         """Update layout records from a new Malcolm layout table"""
-        for index, name in enumerate(table["name"]):
-            for column, record_info in self._layout_records.get(name, {}).items():
+        for layout_names, columns in self._layout_records:
+            index = _layout_index(table, layout_names)
+            if index is None:
+                continue
+            for column, record_info in columns.items():
+                record = record_info.record
                 value = _layout_record_value(column, table[column][index])
-                if record_info.record.get() != value:
-                    record_info.record.set(value, process=False)
+                if record.name in self._invalid_layout_records:
+                    self._invalid_layout_records.discard(record.name)
+                    record.set_alarm(alarm.NO_ALARM, alarm.NO_ALARM)
+                if record.get() != value:
+                    record.set(value, process=False)
+
+    def invalidate_layout_records(self) -> None:
+        """Mark layout records invalid, as Malcolm is not connected"""
+        for _, columns in self._layout_records:
+            for record_info in columns.values():
+                record_info.record.set_alarm(alarm.INVALID_ALARM, alarm.UDF_ALARM)
+                self._invalid_layout_records.add(record_info.record.name)
 
     def create_version_records(self, firmware_versions: dict[EpicsName, str]):
         """Creates handful of records for tracking versions of IOC/Firmware via EPICS
@@ -2030,6 +2091,18 @@ class IocRecordFactory:
 def _layout_record_value(column: str, value: Any) -> float | int:
     """Convert a Malcolm layout table value into the matching record value"""
     return int(bool(value)) if column == "visible" else float(value)
+
+
+def _layout_name(table: LayoutTable, layout_names: tuple[str, ...]) -> str | None:
+    """Return whichever of `layout_names` is in the Malcolm layout table, if any"""
+    names = table.get("name", [])
+    return next((name for name in layout_names if name in names), None)
+
+
+def _layout_index(table: LayoutTable, layout_names: tuple[str, ...]) -> int | None:
+    """Return the row of the Malcolm layout table for a block, if it has one"""
+    name = _layout_name(table, layout_names)
+    return None if name is None else table["name"].index(name)
 
 
 async def create_records(
@@ -2120,14 +2193,19 @@ async def create_records(
                 block_records.update(records)
 
             if layout_client:
-                layout_names = layout_client.table.get("name", [])
                 # Malcolm may number single-instance blocks e.g. "PCAP1"
-                candidates = (suffixed_block, f"{block}{block_num + 1}")
-                layout_name = next((n for n in candidates if n in layout_names), None)
-                if layout_name:
+                layout_names = tuple(
+                    dict.fromkeys((suffixed_block, f"{block}{block_num + 1}"))
+                )
+                # Skip blocks Malcolm doesn't know about. If it isn't connected,
+                # create records for every block and fill them in once it is
+                if (
+                    not layout_client.connected
+                    or _layout_name(layout_client.table, layout_names) is not None
+                ):
                     block_records.update(
                         record_factory.create_layout_records(
-                            suffixed_block, layout_name, layout_client
+                            suffixed_block, layout_names, layout_client
                         )
                     )
 
@@ -2138,7 +2216,11 @@ async def create_records(
     record_factory.initialise(dispatcher)
 
     if layout_client:
+        if not layout_client.connected:
+            # Done after initialisation, which would clear an alarm set before it
+            record_factory.invalidate_layout_records()
         layout_client.on_update = record_factory.update_layout_records
+        layout_client.on_disconnect = record_factory.invalidate_layout_records
 
     block_info_dict = {key: value.block_info for key, value in panda_dict.items()}
     return (all_records, all_values_dict, block_info_dict)
@@ -2239,9 +2321,15 @@ async def update(
                         field = block_label
 
                 if field not in all_records:
-                    logging.error(
-                        f"Unknown field {field} returned from GetChanges values"
-                    )
+                    if _is_metadata(field) and not block_label:
+                        # Metadata such as *METADATA.DESIGN has no record. It is
+                        # reported after every reconnection, as a new connection
+                        # gets every value in its first GetChanges
+                        logging.debug(f"Ignoring {field} returned from GetChanges")
+                    else:
+                        logging.error(
+                            f"Unknown field {field} returned from GetChanges values"
+                        )
                     continue
 
                 record_info = all_records[field]
@@ -2294,6 +2382,11 @@ async def update(
             for table_field, value_list in changes.multiline_values.items():
                 table_field = PandAName(table_field)
                 table_field = panda_to_epics_name(table_field)
+                if _is_metadata(table_field):
+                    # Multiline metadata such as *METADATA.LAYOUT, which the web GUI
+                    # rewrites whenever a block is moved, is not a table
+                    logging.debug(f"Ignoring {table_field} returned from GetChanges")
+                    continue
                 # Tables must have a MODE record defined - use it to update the table
                 mode_record_name = EpicsName(table_field + ":MODE")
                 if mode_record_name not in all_records:
